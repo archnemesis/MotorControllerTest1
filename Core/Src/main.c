@@ -42,6 +42,7 @@
 #include "main.h"
 #include "adc.h"
 #include "dac.h"
+#include "dma.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -52,6 +53,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "sixstep.h"
+#include "telemetry.h"
 
 /* USER CODE END Includes */
 
@@ -75,6 +77,8 @@
 /* USER CODE BEGIN PV */
 
 static int is_running = 0;
+#define msg_tx_buffer_length 32
+static uint8_t msg_tx_buffer[msg_tx_buffer_length] = { 0 };
 
 /* USER CODE END PV */
 
@@ -82,6 +86,7 @@ static int is_running = 0;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void print_serial(const char * str);
+void periodic(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -117,18 +122,27 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_TIM1_Init();
   MX_DAC_Init();
   MX_TIM2_Init();
+  MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
 
   /* Configure TIM1 to disable PWM outputs when the core is halted */
   __HAL_DBGMCU_FREEZE_TIM1();
 
   SixStep_Init();
-  print_serial("MotorControllerTest1 v1.0\r\n");
+  SixStep_StartTimer();
+  SixStep_StartADC();
+
+  HAL_TIM_Base_Start_IT(&htim16);
+
+  HAL_Delay(3000);
+  SixStep_StartMotor();
+  is_running = 1;
 
   /* USER CODE END 2 */
 
@@ -139,8 +153,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    print_serial("Testing\r\n");
-    HAL_Delay(1000);
   }
   /* USER CODE END 3 */
 }
@@ -180,8 +192,10 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_TIM1|RCC_PERIPHCLK_ADC1;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_TIM1|RCC_PERIPHCLK_TIM16
+                              |RCC_PERIPHCLK_ADC1;
   PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;
+  PeriphClkInit.Tim16ClockSelection = RCC_TIM16CLK_HCLK;
   PeriphClkInit.Adc1ClockSelection = RCC_ADC1PLLCLK_DIV1;
 
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
@@ -191,6 +205,25 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void periodic(void)
+{
+  static unsigned int cnt10 = 0;
+  static unsigned int cnt11 = 0;
+
+  //if (cnt10 == 9) {
+    SixStep_LowFreqTask();
+  //  cnt10 = 0;
+  //}
+
+  if (cnt11 == 449) {
+    telemetry_msg_status_send(0, SixStep_GetVBUS(), SixStep_GetTemp(), SixStep_GetCurrent(), SixStep_GetTimerSpeed());
+    cnt11 = 0;
+  }
+
+  cnt10++;
+  cnt11++;
+}
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
@@ -204,34 +237,51 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM2) {
     SixStep_CommutationInterrupt();
   }
+  else if (htim->Instance == TIM16) {
+    periodic();
+  }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  switch (GPIO_Pin) {
-  case B1_Pin:
-    if (is_running == 0) {
-      SixStep_StartMotor();
-      is_running = 1;
-    }
-    else {
-      SixStep_StopMotor();
-      is_running = 0;
-    }
-
-    break;
-  }
+//  switch (GPIO_Pin) {
+//  case B1_Pin:
+//    if (is_running == 0) {
+//      SixStep_StartMotor();
+//      is_running = 1;
+//    }
+//    else {
+//      SixStep_StopMotor();
+//      is_running = 0;
+//    }
+//
+//    break;
+//  }
 }
 
-void __io_putchar(int ch)
+void telemetry_msg_set_speed_callback(telemetry_msg_set_speed_t *speed)
 {
-  HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
+  SixStep_SetTimerSpeed(speed->speed);
 }
 
-int fputc(int ch, FILE *f)
+void telemetry_msg_stop_callback(telemetry_msg_stop_t *stop)
 {
-  HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 0xFFFF);
-  return ch;
+  (void)stop;
+  SixStep_StopMotor();
+}
+
+void telemetry_msg_start_callback(telemetry_msg_start_t *start)
+{
+  (void)start;
+  SixStep_StartMotor();
+}
+
+void telemetry_send_bytes(uint8_t * bytes, size_t len)
+{
+  msg_tx_buffer[0] = 0xAB;
+  msg_tx_buffer[1] = 0xBA;
+  memcpy((void *)&msg_tx_buffer[2], (void *)&bytes[0], len);
+  HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&msg_tx_buffer[0], len + 2);
 }
 
 void print_serial(const char *str)

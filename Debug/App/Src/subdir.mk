@@ -4,13 +4,16 @@
 
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
-../App/Src/sixstep.c 
+../App/Src/sixstep.c \
+../App/Src/telemetry.c 
 
 OBJS += \
-./App/Src/sixstep.o 
+./App/Src/sixstep.o \
+./App/Src/telemetry.o 
 
 C_DEPS += \
-./App/Src/sixstep.d 
+./App/Src/sixstep.d \
+./App/Src/telemetry.d 
 
 
 # Each subdirectory must supply rules for building sources it contributes

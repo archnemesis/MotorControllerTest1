@@ -107,7 +107,8 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
     PC3     ------> ADC1_IN9
     PA1     ------> ADC1_IN2
     PA7     ------> ADC1_IN15
-    PB0     ------> ADC1_IN11 
+    PB0     ------> ADC1_IN11
+    PB11     ------> ADC1_IN14 
     */
     GPIO_InitStruct.Pin = CURR_SENS_Pin|TEMP_Pin|BEMF1_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
@@ -119,10 +120,10 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Pin = BEMF2_Pin;
+    GPIO_InitStruct.Pin = BEMF2_Pin|GPIO_PIN_11;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(BEMF2_GPIO_Port, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     /* ADC1 interrupt Init */
     HAL_NVIC_SetPriority(ADC1_IRQn, 0, 0);
@@ -150,13 +151,14 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
     PC3     ------> ADC1_IN9
     PA1     ------> ADC1_IN2
     PA7     ------> ADC1_IN15
-    PB0     ------> ADC1_IN11 
+    PB0     ------> ADC1_IN11
+    PB11     ------> ADC1_IN14 
     */
     HAL_GPIO_DeInit(GPIOC, CURR_SENS_Pin|TEMP_Pin|BEMF1_Pin);
 
     HAL_GPIO_DeInit(GPIOA, VBUS_SENS_Pin|BEMF3_Pin);
 
-    HAL_GPIO_DeInit(BEMF2_GPIO_Port, BEMF2_Pin);
+    HAL_GPIO_DeInit(GPIOB, BEMF2_Pin|GPIO_PIN_11);
 
     /* ADC1 interrupt Deinit */
     HAL_NVIC_DisableIRQ(ADC1_IRQn);

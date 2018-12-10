@@ -1,6 +1,8 @@
 "App/Src/sixstep.o"
+"App/Src/telemetry.o"
 "Core/Src/adc.o"
 "Core/Src/dac.o"
+"Core/Src/dma.o"
 "Core/Src/gpio.o"
 "Core/Src/main.o"
 "Core/Src/stm32f3xx_hal_msp.o"

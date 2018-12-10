@@ -16,19 +16,45 @@ extern void Error_Handler(void);
 #define SIXSTEP_MODE_ALIGN  0x01
 #define SIXSTEP_MODE_RAMPUP 0x02
 #define SIXSTEP_MODE_CLOSED 0x04
-#define SIXSTEP_BEMF_SAMPLETIME ADC_SAMPLETIME_61CYCLES_5
-#define SIXSTEP_ADC_VBUS_FILTER_DEPTH 10
-#define SIXSTEP_ADC_TEMP_FILTER_DEPTH 10
-#define SIXSTEP_ADC_CURRENT_FILTER_DEPTH 10
+
+#define SIXSTEP_BEMF_SAMPLETIME           ADC_SAMPLETIME_61CYCLES_5
+#define SIXSTEP_ADC_VBUS_FILTER_DEPTH     20
+#define SIXSTEP_ADC_TEMP_FILTER_DEPTH     20
+#define SIXSTEP_ADC_CURRENT_FILTER_DEPTH  20
+#define SIXSTEP_ADC_BEMF_BUFFER_LEN       100
+#define SIXSTEP_DEMAG_TIME                10
+#define SIXSTEP_BEMF_THRESHOLD_UP         200
+#define SIXSTEP_BEMF_THRESHOLD_DOWN       200
+#define SIXSTEP_RAMPUP_TARGET             1000
+#define SIXSTEP_PI_KP                     4000
+#define SIXSTEP_PI_KI                     50
+#define SIXSTEP_PI_MIN                    120
+#define SIXSTEP_PI_MAX                    3000
+#define SIXSTEP_PI_DIV                    4096
 
 static int is_running = 0;
 static int current_mode = SIXSTEP_MODE_RAMPUP;
 static int current_step = 0;
+static int speed_target = 0;
+static int pi_i_accum = 0;
+static unsigned int last_arr = 0;
 static volatile unsigned long int adc_temp = 0;
 static volatile unsigned long int adc_vbus = 0;
 static volatile unsigned long int adc_current = 0;
 static volatile int adc_ovf = 0;
 static volatile int adc_udf = 0;
+static int adc_last_step = -1;
+static int zcross_last_step = -1;
+static int demag_counter = 0;
+static int demag_time = 0;
+static int zcross_counter = 0;
+static int zcross_detected = 0;
+static int zcross_missed = 1;
+
+static uint32_t comm_arr = 0;
+
+static unsigned int per_zcross[3] = {0};
+static unsigned int tim_zcross[3] = {0};
 
 static int adc_bemf_current_channel = ADC_CHANNEL_9;
 static int adc_bemf_channel[3] = {
@@ -39,14 +65,9 @@ static int adc_bemf_channel[3] = {
 
 static int adc_inst_current_channel = 0;
 static int adc_inst_channel[3] = {
-    ADC_CHANNEL_7,  // current sense
+    ADC_CHANNEL_14,  // current sense
     ADC_CHANNEL_8,  // temperature
     ADC_CHANNEL_2   // vbus
-};
-static int adc_inst_sampletime[3] = {
-    ADC_SAMPLETIME_1CYCLE_5,
-    ADC_SAMPLETIME_61CYCLES_5,
-    ADC_SAMPLETIME_61CYCLES_5
 };
 
 static int adc_filter_vbus_i = 0;
@@ -57,8 +78,10 @@ static uint16_t adc_filter_vbus[SIXSTEP_ADC_VBUS_FILTER_DEPTH] = {0};
 static uint16_t adc_filter_temp[SIXSTEP_ADC_TEMP_FILTER_DEPTH] = {0};
 static uint16_t adc_filter_current[SIXSTEP_ADC_CURRENT_FILTER_DEPTH] = {0};
 
-#define PWM_VAL 600
+#define PWM_VAL 550
 #define MOTOR_POLES 7
+
+int GetDemagDelay(int speed);
 
 void SixStep_Init(void)
 {
@@ -75,8 +98,8 @@ void SixStep_Init(void)
     Error_Handler();
   }
 
-  sConfig.Channel = ADC_CHANNEL_7;
-  sConfig.SamplingTime = ADC_SAMPLETIME_19CYCLES_5;
+  sConfig.Channel = ADC_CHANNEL_14;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
 
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -90,25 +113,30 @@ void SixStep_Init(void)
   }
 
   sConfig.Channel = ADC_CHANNEL_9;
-  sConfig.SamplingTime = ADC_SAMPLETIME_61CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
 
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
     Error_Handler();
   }
 
   sConfig.Channel = ADC_CHANNEL_11;
-  sConfig.SamplingTime = ADC_SAMPLETIME_61CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
 
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
     Error_Handler();
   }
 
   sConfig.Channel = ADC_CHANNEL_15;
-  sConfig.SamplingTime = ADC_SAMPLETIME_61CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
 
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
     Error_Handler();
   }
+}
+
+void SixStep_StartTimer(void)
+{
+  HAL_TIM_Base_Start(&htim1);
 }
 
 void SixStep_StartMotor(void)
@@ -118,8 +146,6 @@ void SixStep_StartMotor(void)
   }
 
   /* Start Output PWM */
-  HAL_TIM_Base_Start_IT(&htim1);
-
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
@@ -130,11 +156,18 @@ void SixStep_StartMotor(void)
 
   /* Start Current Reference DAC */
   HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
-  HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 1200); /* 500mA current limit */
+  HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2000); /* 500mA current limit */
 
-  SixStep_SetTimerSpeed(1000);
+  current_mode = SIXSTEP_MODE_ALIGN;
+  SixStep_SetTimerSpeed(SIXSTEP_RAMPUP_TARGET);
+  adc_last_step = 0;
+  demag_counter = 0;
+  current_step = 5;
+  speed_target = 3000;
+  zcross_counter = 0;
   SixStep_Commutate(5);
-  SixStep_StartADC();
+
+  current_mode = SIXSTEP_MODE_RAMPUP;
 
   /* Start Commutation Timer */
   HAL_TIM_Base_Start_IT(&htim2);
@@ -144,11 +177,10 @@ void SixStep_StartMotor(void)
 
 void SixStep_StopMotor(void)
 {
+  is_running = 0;
+
   /* Stop commutation timer */
   HAL_TIM_Base_Stop_IT(&htim2);
-
-  /* Stop ADC */
-  HAL_ADC_Stop_IT(&hadc1);
 
   /* Clear and deactivate PWM channels */
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
@@ -159,50 +191,166 @@ void SixStep_StopMotor(void)
   HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
 
-  HAL_TIM_Base_Stop_IT(&htim1);
-
   /* Pull all input pins on L6230 LOW */
   HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_RESET);
-
-  is_running = 0;
 }
 
 void SixStep_StartADC(void)
 {
+  while (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK);
   HAL_ADC_Start_IT(&hadc1);
+}
+
+void SixStep_LowFreqTask(void)
+{
+  int32_t P = 0;
+  int32_t I = 0;
+  int32_t i_sum_tmp = 0;
+  int32_t output = 0;
+  int32_t error = 0;
+
+  if (is_running == 1) {
+    if (current_mode == SIXSTEP_MODE_CLOSED) {
+      error = speed_target - SixStep_GetTimerSpeed();
+      P = SIXSTEP_PI_KP * error;
+      I = SIXSTEP_PI_KI * error;
+
+      i_sum_tmp = pi_i_accum + I;
+      pi_i_accum = i_sum_tmp;
+
+      output = HAL_DAC_GetValue(&hdac, DAC_CHANNEL_1) + (P / SIXSTEP_PI_DIV) + (I / SIXSTEP_PI_DIV);
+
+      if (output > SIXSTEP_PI_MAX) {
+        output = SIXSTEP_PI_MAX;
+      }
+      if (output < SIXSTEP_PI_MIN) {
+        output = SIXSTEP_PI_MIN;
+      }
+
+      HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, output);
+    }
+  }
 }
 
 void SixStep_CommutationInterrupt(void)
 {
-  if (current_mode != SIXSTEP_MODE_RAMPUP) {
-    return;
-  }
-
-  SixStep_Commutate(current_step);
-
+  demag_counter = 0;
+  demag_time = GetDemagDelay(SixStep_GetTimerSpeed());
   current_step++;
   if (current_step == 6) {
     current_step = 0;
   }
+
+  SixStep_Commutate(current_step);
 }
 
+int GetDemagDelay(int speed)
+{
+  if (speed < 1000) {
+    return 14;
+  } else if (speed < 1300) {
+    return 13;
+  } else if (speed < 1500) {
+    return 12;
+  } else if (speed < 1800) {
+    return 11;
+  } else if (speed < 2600) {
+    return 10;
+  } else if (speed < 3300) {
+    return 9;
+  } else if (speed < 3650) {
+    return 8;
+  } else if (speed < 4100) {
+    return 7;
+  } else if (speed < 4650) {
+    return 6;
+  } else if (speed < 5400) {
+    return 5;
+  } else if (speed < 6400) {
+    return 4;
+  } else if (speed < 7800) {
+    return 3;
+  } else if (speed < 10000) {
+    return 2;
+  } else {
+    return 1;
+  }
+}
+
+/*
+ * @brief Read ADC channels (VBUS, current, temperature, BEMF) and calculate
+ * the zero-crossing and commutation times.
+ */
 void SixStep_ADCInterrupt(void)
 {
   uint16_t next_channel;
+  uint16_t timer_arr;
+  uint16_t timer_cnt;
+  uint16_t timer_new_arr;
   uint32_t val = HAL_ADC_GetValue(&hadc1);
 
-  /* Up-counting, so we have the latest BEMF reading */
-  if (!__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
-    /* TODO: delay for de-magnetization */
+  /* Down-counting, so we have the latest BEMF reading */
+  if (__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
+    if (zcross_last_step != current_step) {
+      if (zcross_detected == 1) {
+        zcross_counter++;
+      }
+      else {
+        zcross_counter = 0;
+      }
 
-    if (current_mode == SIXSTEP_MODE_RAMPUP) {
-      /* check current speed and count z-crossings */
+      zcross_detected = 0;
+      zcross_last_step = current_step;
     }
-    else if (current_mode == SIXSTEP_MODE_CLOSED)
-    {
-      /* TODO: process BEMF reading here */
+
+    if (is_running == 1) {
+      if (demag_counter > demag_time) {
+        if (adc_last_step != current_step) {
+          switch (current_step) {
+          case 0:
+          case 2:
+          case 4:
+            if (val < SIXSTEP_BEMF_THRESHOLD_DOWN) {
+              zcross_detected = 1;
+
+              if (current_mode == SIXSTEP_MODE_CLOSED) {
+                timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
+                timer_new_arr = (timer_cnt + (comm_arr / 2));
+                __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
+                comm_arr = timer_new_arr;
+              }
+
+              HAL_GPIO_WritePin(DEBUG3_GPIO_Port, DEBUG3_Pin, GPIO_PIN_RESET);
+
+              adc_last_step = current_step;
+            }
+            break;
+          case 1:
+          case 3:
+          case 5:
+            if (val > SIXSTEP_BEMF_THRESHOLD_UP) {
+              zcross_detected = 1;
+
+              if (current_mode == SIXSTEP_MODE_CLOSED) {
+                timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
+                timer_new_arr = (timer_cnt + (comm_arr / 2));
+                __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
+                comm_arr = timer_new_arr;
+              }
+
+              HAL_GPIO_WritePin(DEBUG3_GPIO_Port, DEBUG3_Pin, GPIO_PIN_SET);
+
+              adc_last_step = current_step;
+            }
+            break;
+          }
+        }
+      }
+      else {
+        demag_counter++;
+      }
     }
 
     // next read will be instrumentation channel
@@ -210,10 +358,8 @@ void SixStep_ADCInterrupt(void)
 
     adc_ovf = 1;
   }
-  /* Down-counting, cycling through the instrumentation readings */
-  else {
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-
+  /* Up-counting, cycling through the instrumentation readings */
+  else if (!__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
     /* TODO: process instrumentation reading here */
     switch (adc_inst_current_channel) {
     case 0:
@@ -268,7 +414,6 @@ void SixStep_ADCInterrupt(void)
     // next read will be BEMF channel
     next_channel = adc_bemf_current_channel;
     adc_udf = 1;
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
   }
 
   hadc1.Instance->CR |= ADC_CR_ADSTP;
@@ -282,65 +427,88 @@ void SixStep_SetTimerSpeed(unsigned int rpm)
 {
   unsigned long t = 60000000 / (MOTOR_POLES * rpm * 6);
   __HAL_TIM_SET_AUTORELOAD(&htim2, t);
+  comm_arr = t;
+}
+
+unsigned int SixStep_GetTimerSpeed(void)
+{
+  unsigned long rpm = 60000000 / (MOTOR_POLES * comm_arr * 6);
+  return rpm;
 }
 
 void SixStep_Commutate(int step)
 {
+  if (current_mode == SIXSTEP_MODE_RAMPUP) {
+    int current_speed = SixStep_GetTimerSpeed();
+    if (current_speed < SIXSTEP_RAMPUP_TARGET) {
+      int new_speed = current_speed + 1;
+      //SixStep_SetTimerSpeed(new_speed);
+    }
+    else {
+      if (zcross_counter > 24) {
+        current_mode = SIXSTEP_MODE_CLOSED;
+      }
+    }
+  }
+  else if (current_mode == SIXSTEP_MODE_CLOSED) {
+    //__HAL_TIM_SET_AUTORELOAD(&htim2, 0xFFFF);
+  }
+
   switch (step)
   {
   case 0:
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, PWM_VAL);
+    HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_RESET);
-    adc_bemf_current_channel = adc_bemf_channel[1];
+    adc_bemf_current_channel = adc_bemf_channel[2];
     break;
   case 1:
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, PWM_VAL);
+    HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_RESET);
-    adc_bemf_current_channel = adc_bemf_channel[2];
+    adc_bemf_current_channel = adc_bemf_channel[1];
     break;
   case 2:
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, PWM_VAL);
+    HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_RESET);
-    adc_bemf_current_channel = adc_bemf_channel[2];
+    adc_bemf_current_channel = adc_bemf_channel[0];
     break;
   case 3:
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, PWM_VAL);
+    HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_RESET);
-    adc_bemf_current_channel = adc_bemf_channel[0];
+    adc_bemf_current_channel = adc_bemf_channel[2];
     break;
   case 4:
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, PWM_VAL);
+    HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_RESET);
-    adc_bemf_current_channel = adc_bemf_channel[0];
+    adc_bemf_current_channel = adc_bemf_channel[1];
     break;
   case 5:
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, PWM_VAL);
+    HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(L6230_EN_CH2_GPIO_Port, L6230_EN_CH2_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(L6230_EN_CH3_GPIO_Port, L6230_EN_CH3_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(L6230_EN_CH1_GPIO_Port, L6230_EN_CH1_Pin, GPIO_PIN_RESET);
-    adc_bemf_current_channel = adc_bemf_channel[1];
+    adc_bemf_current_channel = adc_bemf_channel[0];
     break;
   }
 }
@@ -348,4 +516,25 @@ void SixStep_Commutate(int step)
 void SixStep_SetCurrentLimit(unsigned int current_limit)
 {
 
+}
+
+unsigned int SixStep_GetVBUS(void)
+{
+  unsigned long int vbus_v = ((((unsigned long int)3300 << 16) / 4096) * adc_vbus) >> 16;
+  return vbus_v;
+
+}
+
+unsigned int SixStep_GetCurrent(void)
+{
+  unsigned long int curr_v = ((((unsigned int)3300 << 16) / 4096) * adc_current) >> 16;
+  return curr_v;
+}
+
+unsigned int SixStep_GetTemp(void)
+{
+  unsigned long int temp_v = ((((unsigned long int)3300 << 16) / 4096) * adc_temp) >> 16;
+  unsigned long int r2 = 4700;
+  unsigned long int r1 = ((3300 * r2) / temp_v) - r2;
+  return r1;
 }
