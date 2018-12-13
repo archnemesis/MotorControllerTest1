@@ -19,9 +19,11 @@ void SixStep_Commutate(int step);
 void SixStep_ADCInterrupt(void);
 void SixStep_SetTimerSpeed(unsigned int rpm);
 void SixStep_SetCurrentLimit(unsigned int current_limit);
+void SixStep_SetTargetSpeed(int rpm);
 unsigned int SixStep_GetVBUS(void);
 unsigned int SixStep_GetCurrent(void);
 unsigned int SixStep_GetTemp(void);
 unsigned int SixStep_GetTimerSpeed(void);
+int SixStep_GetFilteredSpeed(void);
 
 #endif /* SIXSTEP_H_ */

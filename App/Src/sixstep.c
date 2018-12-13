@@ -18,13 +18,15 @@ extern void Error_Handler(void);
 #define SIXSTEP_MODE_CLOSED 0x04
 
 #define SIXSTEP_BEMF_SAMPLETIME           ADC_SAMPLETIME_61CYCLES_5
+#define SIXSTEP_SPEED_FILTER_DEPTH        16
 #define SIXSTEP_ADC_VBUS_FILTER_DEPTH     20
 #define SIXSTEP_ADC_TEMP_FILTER_DEPTH     20
 #define SIXSTEP_ADC_CURRENT_FILTER_DEPTH  20
 #define SIXSTEP_ADC_BEMF_BUFFER_LEN       100
 #define SIXSTEP_DEMAG_TIME                10
-#define SIXSTEP_BEMF_THRESHOLD_UP         200
-#define SIXSTEP_BEMF_THRESHOLD_DOWN       200
+#define SIXSTEP_BEMF_THRESHOLD_UP         125
+#define SIXSTEP_BEMF_THRESHOLD_DOWN       125
+#define SIXSTEP_RAMPUP_START_SPEED        10000
 #define SIXSTEP_RAMPUP_TARGET             1000
 #define SIXSTEP_PI_KP                     4000
 #define SIXSTEP_PI_KI                     50
@@ -47,14 +49,14 @@ static int adc_last_step = -1;
 static int zcross_last_step = -1;
 static int demag_counter = 0;
 static int demag_time = 0;
+static int advance = 0;
 static int zcross_counter = 0;
+static int zcross_pre_detected = 0;
 static int zcross_detected = 0;
-static int zcross_missed = 1;
+static int startup_counter = 0;
+static unsigned int last_commutation_time = 0;
 
 static uint32_t comm_arr = 0;
-
-static unsigned int per_zcross[3] = {0};
-static unsigned int tim_zcross[3] = {0};
 
 static int adc_bemf_current_channel = ADC_CHANNEL_9;
 static int adc_bemf_channel[3] = {
@@ -77,6 +79,10 @@ static int adc_filter_current_i = 0;
 static uint16_t adc_filter_vbus[SIXSTEP_ADC_VBUS_FILTER_DEPTH] = {0};
 static uint16_t adc_filter_temp[SIXSTEP_ADC_TEMP_FILTER_DEPTH] = {0};
 static uint16_t adc_filter_current[SIXSTEP_ADC_CURRENT_FILTER_DEPTH] = {0};
+
+static int speed_filter_i = 0;
+static int speed_filter[SIXSTEP_SPEED_FILTER_DEPTH] = {0};
+static int speed_filtered = 0;
 
 #define PWM_VAL 550
 #define MOTOR_POLES 7
@@ -159,13 +165,14 @@ void SixStep_StartMotor(void)
   HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2000); /* 500mA current limit */
 
   current_mode = SIXSTEP_MODE_ALIGN;
-  SixStep_SetTimerSpeed(SIXSTEP_RAMPUP_TARGET);
+  SixStep_SetTimerSpeed(500);
   adc_last_step = 0;
   demag_counter = 0;
   current_step = 5;
-  speed_target = 3000;
+  speed_target = 1000;
   zcross_counter = 0;
   SixStep_Commutate(5);
+  HAL_Delay(500);
 
   current_mode = SIXSTEP_MODE_RAMPUP;
 
@@ -213,7 +220,7 @@ void SixStep_LowFreqTask(void)
 
   if (is_running == 1) {
     if (current_mode == SIXSTEP_MODE_CLOSED) {
-      error = speed_target - SixStep_GetTimerSpeed();
+      error = speed_target - speed_filtered;
       P = SIXSTEP_PI_KP * error;
       I = SIXSTEP_PI_KI * error;
 
@@ -234,13 +241,39 @@ void SixStep_LowFreqTask(void)
   }
 }
 
+void SixStep_SetTargetSpeed(int rpm)
+{
+  speed_target = rpm;
+}
+
 void SixStep_CommutationInterrupt(void)
 {
+  long int temp = 0;
+
+  speed_filter[speed_filter_i++] = 60000000 / (MOTOR_POLES * __HAL_TIM_GET_AUTORELOAD(&htim2) * 6);
+  if (speed_filter_i == SIXSTEP_SPEED_FILTER_DEPTH) {
+    for (int i = 0; i < SIXSTEP_SPEED_FILTER_DEPTH; i++) {
+      temp += speed_filter[i];
+    }
+    temp /= SIXSTEP_SPEED_FILTER_DEPTH;
+    speed_filtered = temp;
+    speed_filter_i = 0;
+  }
+
   demag_counter = 0;
-  demag_time = GetDemagDelay(SixStep_GetTimerSpeed());
+  zcross_pre_detected = 0;
+  demag_time = GetDemagDelay(SixStep_GetFilteredSpeed());
+  advance = GetPhaseAdvance(SixStep_GetTimerSpeed());
   current_step++;
   if (current_step == 6) {
     current_step = 0;
+  }
+
+  if (current_mode == SIXSTEP_MODE_RAMPUP) {
+    if (startup_counter++ == 2) {
+      // set to normal startup speed after two quick commutations
+      //SixStep_SetTimerSpeed(SIXSTEP_RAMPUP_TARGET);
+    }
   }
 
   SixStep_Commutate(current_step);
@@ -261,11 +294,11 @@ int GetDemagDelay(int speed)
   } else if (speed < 3300) {
     return 9;
   } else if (speed < 3650) {
-    return 8;
-  } else if (speed < 4100) {
     return 7;
-  } else if (speed < 4650) {
+  } else if (speed < 4100) {
     return 6;
+  } else if (speed < 4650) {
+    return 5;
   } else if (speed < 5400) {
     return 5;
   } else if (speed < 6400) {
@@ -279,6 +312,39 @@ int GetDemagDelay(int speed)
   }
 }
 
+int GetPhaseAdvance(int speed)
+{
+  if (speed < 1000) {
+    return 0;
+  } else if (speed < 1300) {
+    return 0;
+  } else if (speed < 1500) {
+    return 0;
+  } else if (speed < 1800) {
+    return 1;
+  } else if (speed < 2600) {
+    return 2;
+  } else if (speed < 3300) {
+    return 3;
+  } else if (speed < 3650) {
+    return 4;
+  } else if (speed < 4100) {
+    return 4;
+  } else if (speed < 4650) {
+    return 5;
+  } else if (speed < 5400) {
+    return 5;
+  } else if (speed < 6400) {
+    return 6;
+  } else if (speed < 7800) {
+    return 6;
+  } else if (speed < 10000) {
+    return 7;
+  } else {
+    return 8;
+  }
+}
+
 /*
  * @brief Read ADC channels (VBUS, current, temperature, BEMF) and calculate
  * the zero-crossing and commutation times.
@@ -286,9 +352,10 @@ int GetDemagDelay(int speed)
 void SixStep_ADCInterrupt(void)
 {
   uint16_t next_channel;
-  uint16_t timer_arr;
-  uint16_t timer_cnt;
-  uint16_t timer_new_arr;
+  uint32_t timer_arr;
+  uint32_t timer_cnt;
+  uint32_t timer_new_arr;
+  uint8_t zcross_missed = 0;
   uint32_t val = HAL_ADC_GetValue(&hadc1);
 
   /* Down-counting, so we have the latest BEMF reading */
@@ -299,8 +366,14 @@ void SixStep_ADCInterrupt(void)
       }
       else {
         zcross_counter = 0;
+        zcross_missed = 1;
       }
 
+      if (current_mode == SIXSTEP_MODE_CLOSED) {
+        __HAL_TIM_SET_AUTORELOAD(&htim2, 0xFFFF);
+      }
+
+      zcross_pre_detected = 0;
       zcross_detected = 0;
       zcross_last_step = current_step;
     }
@@ -316,15 +389,32 @@ void SixStep_ADCInterrupt(void)
               zcross_detected = 1;
 
               if (current_mode == SIXSTEP_MODE_CLOSED) {
-                timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
-                timer_new_arr = (timer_cnt + (comm_arr / 2));
-                __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
-                comm_arr = timer_new_arr;
+                if (demag_counter == (demag_time + 1) && advance > 0) {
+                  /**
+                   * Zero-crossing was missed so we have to advance the
+                   * commutation by about 7.5 degrees.
+                   */
+                  //HAL_TIM_GenerateEvent(&htim2, TIM_EVENTSOURCE_UPDATE);
+                  timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
+                  timer_new_arr = timer_cnt + (timer_cnt / 6);
+                  __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
+                  comm_arr = timer_cnt + (comm_arr / 2);
+                }
+                else {
+                  timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
+                  timer_new_arr = (timer_cnt + (comm_arr / 2));
+                  __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
+                  comm_arr = timer_new_arr;
+                }
               }
 
               HAL_GPIO_WritePin(DEBUG3_GPIO_Port, DEBUG3_Pin, GPIO_PIN_RESET);
 
+              zcross_pre_detected = 0;
               adc_last_step = current_step;
+            }
+            else {
+              zcross_pre_detected++;
             }
             break;
           case 1:
@@ -334,15 +424,32 @@ void SixStep_ADCInterrupt(void)
               zcross_detected = 1;
 
               if (current_mode == SIXSTEP_MODE_CLOSED) {
-                timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
-                timer_new_arr = (timer_cnt + (comm_arr / 2));
-                __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
-                comm_arr = timer_new_arr;
+                if (demag_counter == (demag_time + 1) && advance > 0) {
+                  /**
+                   * Zero-crossing was missed so we have to advance the
+                   * commutation by about 7.5 degrees.
+                   */
+                  //HAL_TIM_GenerateEvent(&htim2, TIM_EVENTSOURCE_UPDATE);
+                  timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
+                  timer_new_arr = timer_cnt + (timer_cnt / 6);
+                  __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
+                  comm_arr = timer_cnt + (comm_arr / 2);
+                }
+                else {
+                  timer_cnt = __HAL_TIM_GET_COUNTER(&htim2);
+                  timer_new_arr = (timer_cnt + (comm_arr / 2));
+                  __HAL_TIM_SET_AUTORELOAD(&htim2, timer_new_arr);
+                  comm_arr = timer_new_arr;
+                }
               }
 
               HAL_GPIO_WritePin(DEBUG3_GPIO_Port, DEBUG3_Pin, GPIO_PIN_SET);
 
+              zcross_pre_detected = 0;
               adc_last_step = current_step;
+            }
+            else {
+              zcross_pre_detected++;
             }
             break;
           }
@@ -440,18 +547,17 @@ void SixStep_Commutate(int step)
 {
   if (current_mode == SIXSTEP_MODE_RAMPUP) {
     int current_speed = SixStep_GetTimerSpeed();
+    comm_arr = __HAL_TIM_GET_AUTORELOAD(&htim2);
     if (current_speed < SIXSTEP_RAMPUP_TARGET) {
       int new_speed = current_speed + 1;
-      //SixStep_SetTimerSpeed(new_speed);
+      SixStep_SetTimerSpeed(new_speed);
+      zcross_counter = 0;
     }
     else {
-      if (zcross_counter > 24) {
+      if (zcross_counter > 48) {
         current_mode = SIXSTEP_MODE_CLOSED;
       }
     }
-  }
-  else if (current_mode == SIXSTEP_MODE_CLOSED) {
-    //__HAL_TIM_SET_AUTORELOAD(&htim2, 0xFFFF);
   }
 
   switch (step)
@@ -537,4 +643,9 @@ unsigned int SixStep_GetTemp(void)
   unsigned long int r2 = 4700;
   unsigned long int r1 = ((3300 * r2) / temp_v) - r2;
   return r1;
+}
+
+int SixStep_GetFilteredSpeed(void)
+{
+  return speed_filtered;
 }

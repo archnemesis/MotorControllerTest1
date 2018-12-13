@@ -144,6 +144,15 @@ int main(void)
   SixStep_StartMotor();
   is_running = 1;
 
+  HAL_Delay(5000);
+  SixStep_SetTargetSpeed(3000);
+  HAL_Delay(5000);
+  SixStep_SetTargetSpeed(4000);
+  HAL_Delay(5000);
+  SixStep_SetTargetSpeed(5000);
+  HAL_Delay(5000);
+  SixStep_SetTargetSpeed(6000);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -217,7 +226,7 @@ void periodic(void)
   //}
 
   if (cnt11 == 449) {
-    telemetry_msg_status_send(0, SixStep_GetVBUS(), SixStep_GetTemp(), SixStep_GetCurrent(), SixStep_GetTimerSpeed());
+    telemetry_msg_status_send(0, SixStep_GetVBUS(), SixStep_GetTemp(), SixStep_GetCurrent(), SixStep_GetFilteredSpeed());
     cnt11 = 0;
   }
 
